@@ -523,6 +523,106 @@ class DPNoiseList:
         return (noise_list,)
 
 
+class RayTeaCache:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Ray Actors with loaded model"},
+                ),
+                "model_type": (
+                    [
+                        "wan2.1_t2v_1.3B",
+                        "wan2.1_t2v_14B",
+                        "wan2.1_i2v_480p_14B",
+                        "wan2.1_i2v_720p_14B",
+                        "wan2.1_t2v_1.3B_ret_mode",
+                        "wan2.1_t2v_14B_ret_mode",
+                        "wan2.1_i2v_480p_14B_ret_mode",
+                        "wan2.1_i2v_720p_14B_ret_mode",
+                    ],
+                    {"default": "wan2.1_t2v_14B", "tooltip": "Supported diffusion model type."},
+                ),
+                "rel_l1_thresh": (
+                    "FLOAT",
+                    {
+                        "default": 0.2,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative.",
+                    },
+                ),
+                "start_percent": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "The start percentage of the steps that will apply TeaCache.",
+                    },
+                ),
+                "end_percent": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "The end percentage of the steps that will apply TeaCache.",
+                    },
+                ),
+                "cache_device": (
+                    ["cuda", "cpu"],
+                    {"default": "cuda", "tooltip": "Device where the cache will reside."},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
+    FUNCTION = "apply_teacache"
+    CATEGORY = "Raylight"
+
+    def apply_teacache(
+        self,
+        ray_actors,
+        model_type: str,
+        rel_l1_thresh: float,
+        start_percent: float,
+        end_percent: float,
+        cache_device: str,
+    ):
+        """
+        Apply TeaCache to all RayWorkers.
+        This should be called after the model is loaded and USP is patched (if using USP).
+        """
+        if rel_l1_thresh == 0:
+            return (ray_actors,)
+
+        gpu_actors = ray_actors["workers"]
+
+        # Apply teacache to all workers
+        futures = []
+        for actor in gpu_actors:
+            futures.append(
+                actor.apply_teacache.remote(
+                    model_type,
+                    rel_l1_thresh,
+                    start_percent,
+                    end_percent,
+                    cache_device,
+                )
+            )
+
+        ray.get(futures)
+
+        return (ray_actors,)
+
+
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
@@ -530,6 +630,7 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "DPNoiseList": DPNoiseList,
+    "RayTeaCache": RayTeaCache,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -538,5 +639,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
-    "DPNoiseList": "Data Parallel Noise List"
+    "DPNoiseList": "Data Parallel Noise List",
+    "RayTeaCache": "TeaCache (Ray)",
 }

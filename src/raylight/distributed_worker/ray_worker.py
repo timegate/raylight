@@ -156,6 +156,91 @@ class RayWorker:
             USPInjectRegistry.inject,
         )
 
+    def apply_teacache(
+        self,
+        model_type,
+        rel_l1_thresh,
+        start_percent,
+        end_percent,
+        cache_device_str,
+    ):
+        """
+        Apply TeaCache to the diffusion model.
+        This should be called after the model is loaded and USP is patched (if using USP).
+        """
+        if rel_l1_thresh == 0:
+            return
+
+        from raylight.teacache_integration import (
+            SUPPORTED_MODELS_COEFFICIENTS,
+            teacache_wanmodel_forward,
+        )
+        from raylight.diffusion_models.wan.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_teacache_dit_forward,
+        )
+
+        if model_type not in SUPPORTED_MODELS_COEFFICIENTS:
+            raise ValueError(f"Unsupported model type for TeaCache: {model_type}")
+
+        # Get the diffusion model
+        diffusion_model = self.model.get_model_object("diffusion_model")
+        
+        # Set cache device
+        cache_device = self.device if cache_device_str == "cuda" else torch.device("cpu")
+
+        # Store teacache settings in model_options for use during sampling
+        if 'transformer_options' not in self.model.model_options:
+            self.model.model_options['transformer_options'] = {}
+        
+        self.model.model_options["transformer_options"]["rel_l1_thresh"] = rel_l1_thresh
+        self.model.model_options["transformer_options"]["coefficients"] = SUPPORTED_MODELS_COEFFICIENTS[model_type]
+        self.model.model_options["transformer_options"]["model_type"] = model_type
+        self.model.model_options["transformer_options"]["cache_device"] = cache_device
+        self.model.model_options["transformer_options"]["start_percent"] = start_percent
+        self.model.model_options["transformer_options"]["end_percent"] = end_percent
+
+        # Patch the forward function based on model type
+        if "wan2.1" in model_type:
+            # For wan2.1, forward_orig is the entry point used both by the
+            # original model and by USP. When USP is enabled it sets
+            # forward_orig -> usp_dit_forward; for the experimental
+            # USP+TeaCache path we swap in usp_teacache_dit_forward instead.
+
+            has_forward_orig = hasattr(diffusion_model, "forward_orig")
+            usp_is_active = (
+                has_forward_orig
+                and getattr(diffusion_model.forward_orig, "__func__", None)
+                is usp_dit_forward
+            )
+
+            if usp_is_active:
+                # USP is already patched; store the USP forward_orig so we can
+                # still access it later if needed, then install the combined
+                # USP+TeaCache forward.
+                if not hasattr(diffusion_model, "_teacache_original_forward_orig"):
+                    diffusion_model._teacache_original_forward_orig = (
+                        diffusion_model.forward_orig
+                    )
+                diffusion_model.forward_orig = usp_teacache_dit_forward.__get__(
+                    diffusion_model, diffusion_model.__class__
+                )
+            else:
+                # No USP (or unknown forward_orig); fall back to the standard
+                # non-USP TeaCache WAN forward. WAN models typically route
+                # sampling through forward_orig, so ensure it exists.
+                if not hasattr(diffusion_model, "forward_orig"):
+                    diffusion_model.forward_orig = diffusion_model.forward
+                if not hasattr(diffusion_model, "_teacache_original_forward_orig"):
+                    diffusion_model._teacache_original_forward_orig = (
+                        diffusion_model.forward_orig
+                    )
+                diffusion_model.forward_orig = teacache_wanmodel_forward.__get__(
+                    diffusion_model, diffusion_model.__class__
+                )
+        else:
+            raise ValueError(f"Model type {model_type} not yet implemented for raylight")
+
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
@@ -367,6 +452,68 @@ class RayWorker:
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
+        # Setup TeaCache wrapper if teacache is enabled
+        teacache_wrapper = None
+        if 'transformer_options' in self.model.model_options:
+            teacache_opts = self.model.model_options.get('transformer_options', {})
+            if 'rel_l1_thresh' in teacache_opts and teacache_opts.get('rel_l1_thresh', 0) > 0:
+                # Create a wrapper function similar to TeaCache's unet_wrapper_function
+                start_percent = teacache_opts.get('start_percent', 0.0)
+                end_percent = teacache_opts.get('end_percent', 1.0)
+                model_type = teacache_opts.get('model_type', '')
+                is_cfg = 'wan2.1' in model_type or 'flux' in model_type or 'hunyuan_video' in model_type
+                
+                def unet_wrapper_function(model_function, kwargs):
+                    input = kwargs["input"]
+                    timestep = kwargs["timestep"]
+                    c = kwargs["c"]
+                    
+                    # Get sigmas from transformer_options
+                    if "transformer_options" in c and "sample_sigmas" in c["transformer_options"]:
+                        sigmas = c["transformer_options"]["sample_sigmas"]
+                        matched_step_index = (sigmas == timestep[0]).nonzero()
+                        if len(matched_step_index) > 0:
+                            current_step_index = matched_step_index.item()
+                        else:
+                            current_step_index = 0
+                            for i in range(len(sigmas) - 1):
+                                if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                                    current_step_index = i
+                                    break
+                        
+                        if current_step_index == 0:
+                            # Reset teacache state at the start
+                            diffusion_model = self.model.get_model_object("diffusion_model")
+                            if is_cfg:
+                                if hasattr(diffusion_model, 'teacache_state') and \
+                                    diffusion_model.teacache_state[0]['previous_modulated_input'] is not None and \
+                                    diffusion_model.teacache_state[1]['previous_modulated_input'] is not None:
+                                    delattr(diffusion_model, 'teacache_state')
+                            else:
+                                if hasattr(diffusion_model, 'teacache_state'):
+                                    delattr(diffusion_model, 'teacache_state')
+                                if hasattr(diffusion_model, 'accumulated_rel_l1_distance'):
+                                    delattr(diffusion_model, 'accumulated_rel_l1_distance')
+                        
+                        current_percent = current_step_index / (len(sigmas) - 1) if len(sigmas) > 1 else 0
+                        if "transformer_options" not in c:
+                            c["transformer_options"] = {}
+                        c["transformer_options"]["current_percent"] = current_percent
+                        if start_percent <= current_percent <= end_percent:
+                            c["transformer_options"]["enable_teacache"] = True
+                        else:
+                            c["transformer_options"]["enable_teacache"] = False
+                    
+                    return model_function(input, timestep, **c)
+                
+                teacache_wrapper = unet_wrapper_function
+                original_wrapper = getattr(self.model, '_teacache_original_wrapper', None)
+                if original_wrapper is None:
+                    # Store original wrapper if it exists
+                    if hasattr(self.model, 'set_model_unet_function_wrapper'):
+                        self.model._teacache_original_wrapper = getattr(self.model, '_model_unet_function_wrapper', None)
+                    self.model.set_model_unet_function_wrapper(teacache_wrapper)
+
         with torch.no_grad():
             samples = comfy.sample.sample(
                 self.model,
@@ -389,6 +536,15 @@ class RayWorker:
             )
             out = latent.copy()
             out["samples"] = samples
+
+        # Restore original wrapper if it existed
+        if teacache_wrapper is not None:
+            original_wrapper = getattr(self.model, '_teacache_original_wrapper', None)
+            if original_wrapper is not None:
+                self.model.set_model_unet_function_wrapper(original_wrapper)
+            elif hasattr(self.model, 'set_model_unet_function_wrapper'):
+                # Clear the wrapper
+                self.model.set_model_unet_function_wrapper(None)
 
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
             self.model.detach()

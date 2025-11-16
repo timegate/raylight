@@ -1,0 +1,24 @@
+This file documents the experimental USP + TeaCache integration for WAN.
+
+The actual implementation lives in xdit_context_parallel.py as the
+`usp_teacache_dit_forward` function. It is intended as a proof-of-concept
+that merges the original USP forward pass (`usp_dit_forward`) with the
+TeaCache residual caching logic used in the non-USP WAN TeaCache path.
+
+Key points:
+- Residuals are computed in the same space as TeaCache for WAN:
+  after patch embedding + flatten, after sequence-parallel chunking,
+  after the full block stack, but before `head` and `unpatchify`.
+- When TeaCache decides the step can be cached, the block stack is
+  skipped and the cached residual is added directly in the local
+  sequence-parallel chunk, then `head` + all_gather + unpatchify are run.
+- The implementation relies on the `transformer_options` fields that
+  TeaCache already uses: `rel_l1_thresh`, `coefficients`, `cond_or_uncond`,
+  `model_type`, `enable_teacache`, and `cache_device`.
+
+This path is currently considered experimental and has been tested
+primarily for world_size=1 (no real SP). The code is written to follow
+the same structure as `usp_dit_forward`, so it should behave correctly
+for world_size>1 as well, but this has not been extensively validated.
+
+

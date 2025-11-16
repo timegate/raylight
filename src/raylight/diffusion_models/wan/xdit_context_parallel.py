@@ -6,8 +6,21 @@ from xfuser.core.distributed import (
 )
 import raylight.distributed_modules.attention as xfuser_attn
 import comfy
+
 attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
+
+
+def poly1d(coefficients, x):
+    """
+    Small helper matching TeaCache's poly1d implementation.
+    Used to accumulate relative L1 distance and decide whether
+    to reuse cached residuals or recompute the full forward.
+    """
+    result = torch.zeros_like(x)
+    for i, coeff in enumerate(coefficients):
+        result += coeff * (x ** (len(coefficients) - 1 - i))
+    return result
 
 
 def pad_if_odd(t: torch.Tensor, dim: int = 1):
@@ -172,6 +185,181 @@ def usp_dit_forward(
                 x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
             )
 
+    x = self.head(x, e)
+
+    # Context Parallel
+    x = get_sp_group().all_gather(x, dim=1)
+
+    # unpatchify
+    x = self.unpatchify(x, grid_sizes)
+
+    return x
+
+
+def usp_teacache_dit_forward(
+    self,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    freqs=None,
+    transformer_options={},
+    **kwargs,
+):
+    """
+    USP + TeaCache forward for WAN.
+
+    This mirrors `usp_dit_forward` but inserts TeaCache's residual-caching
+    logic in the same space as the non-USP WAN TeaCache implementation:
+    after patch embedding + flatten + SP chunking, after all blocks,
+    but before `head` and `unpatchify`.
+    """
+    # TeaCache options
+    rel_l1_thresh = transformer_options.get("rel_l1_thresh")
+    coefficients = transformer_options.get("coefficients")
+    cond_or_uncond = transformer_options.get("cond_or_uncond")
+    model_type = transformer_options.get("model_type")
+    enable_teacache = transformer_options.get("enable_teacache", True)
+    cache_device = transformer_options.get("cache_device")
+
+    # embeddings
+    x = self.patch_embedding(x.float()).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    x = x.flatten(2).transpose(1, 2)
+
+    # time embeddings
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype)
+    )
+    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+    # context
+    context = self.text_embedding(context)
+
+    context_img_len = None
+    if clip_fea is not None:
+        if self.img_emb is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+        context_img_len = clip_fea.shape[-2]
+
+    # ---- TeaCache state update (shared with non-USP WAN TeaCache) ----
+    # Use timestep embedding as the modulated input, matching TeaCache WAN.
+    modulated_inp = (
+        e0.to(cache_device) if ("ret_mode" in (model_type or "")) else e.to(cache_device)
+    )
+
+    if not hasattr(self, "teacache_state"):
+        # Two slots: 0 -> cond, 1 -> uncond (CFG)
+        self.teacache_state = {
+            0: {
+                "should_calc": True,
+                "accumulated_rel_l1_distance": 0,
+                "previous_modulated_input": None,
+                "previous_residual": None,
+            },
+            1: {
+                "should_calc": True,
+                "accumulated_rel_l1_distance": 0,
+                "previous_modulated_input": None,
+                "previous_residual": None,
+            },
+        }
+
+    def update_cache_state(cache, mod_inp):
+        if cache["previous_modulated_input"] is not None:
+            try:
+                cache["accumulated_rel_l1_distance"] += poly1d(
+                    coefficients,
+                    (
+                        (mod_inp - cache["previous_modulated_input"]).abs().mean()
+                        / cache["previous_modulated_input"].abs().mean()
+                    ),
+                )
+                if cache["accumulated_rel_l1_distance"] < rel_l1_thresh:
+                    cache["should_calc"] = False
+                else:
+                    cache["should_calc"] = True
+                    cache["accumulated_rel_l1_distance"] = 0
+            except Exception:
+                cache["should_calc"] = True
+                cache["accumulated_rel_l1_distance"] = 0
+        cache["previous_modulated_input"] = mod_inp
+
+    # Batch is split into cond / uncond segments along batch dimension.
+    if cond_or_uncond is None:
+        # Fallback: treat the whole batch as a single stream.
+        cond_or_uncond = [0]
+    b = int(len(x) / len(cond_or_uncond))
+
+    for i, k in enumerate(cond_or_uncond):
+        update_cache_state(
+            self.teacache_state[k], modulated_inp[i * b : (i + 1) * b]
+        )
+
+    if enable_teacache:
+        should_calc = False
+        for k in cond_or_uncond:
+            should_calc = should_calc or self.teacache_state[k]["should_calc"]
+    else:
+        should_calc = True
+
+    # ---- USP sequence parallel pre-processing ----
+    x = pad_if_odd(x, dim=1)
+    x = torch.chunk(
+        x, get_sequence_parallel_world_size(), dim=1
+    )[get_sequence_parallel_rank()]
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+
+    if not should_calc:
+        # Reuse cached residuals in the local SP chunk space, then finish
+        # with head + all_gather + unpatchify.
+        for i, k in enumerate(cond_or_uncond):
+            if self.teacache_state[k]["previous_residual"] is not None:
+                x[i * b : (i + 1) * b] += self.teacache_state[k][
+                    "previous_residual"
+                ].to(x.device)
+    else:
+        # Full forward through blocks, then cache residual (post-blocks,
+        # pre-head, in local SP chunk space).
+        ori_x = x.to(cache_device)
+
+        for i, block in enumerate(self.blocks):
+            if ("double_block", i) in blocks_replace:
+
+                def block_wrap(args):
+                    out = {}
+                    out["img"] = block(
+                        args["img"],
+                        context=args["txt"],
+                        e=args["vec"],
+                        freqs=args["pe"],
+                        context_img_len=context_img_len,
+                    )
+                    return out
+
+                out = blocks_replace[("double_block", i)](
+                    {"img": x, "txt": context, "vec": e0, "pe": freqs},
+                    {"original_block": block_wrap},
+                )
+                x = out["img"]
+            else:
+                x = block(
+                    x,
+                    e=e0,
+                    freqs=freqs,
+                    context=context,
+                    context_img_len=context_img_len,
+                )
+
+        for i, k in enumerate(cond_or_uncond):
+            self.teacache_state[k]["previous_residual"] = (
+                x.to(cache_device) - ori_x
+            )[i * b : (i + 1) * b]
+
+    # ---- USP head + SP gather + unpatchify (same as usp_dit_forward) ----
     x = self.head(x, e)
 
     # Context Parallel
